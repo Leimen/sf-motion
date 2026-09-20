@@ -12,7 +12,7 @@ import time
 import io
 import contextlib
 import traceback
-from MotorProtocol import MotorProtocol
+from SFMotionCom import SFMotion
 import queue
 import colorsys
 
@@ -88,7 +88,7 @@ class SerialPortDialog(QtWidgets.QDialog):
 
 
 class DataAcquisitionThread(QtCore.QThread):
-    data_received = QtCore.pyqtSignal(list)
+    data_received = QtCore.pyqtSignal(int, float)
     connection_lost = QtCore.pyqtSignal()
     
     def __init__(self, serial_conn=None, parent=None):
@@ -128,46 +128,79 @@ class DataAcquisitionThread(QtCore.QThread):
     
     def expect_response(self, size):
         self.expected_response_size = size
-
+    
     def parse_buffer(self):
         while True:
+            # Need at least:
+            # HEADER (2) + LENGTH (1)
             if len(self.raw_buffer) < 3:
                 break
-            # print(self.raw_buffer.hex(" "))
+
             header = struct.unpack("<H", self.raw_buffer[:2])[0]
-            # LIVE PLOT
-            if header == 0xABCD:
-                num_channel = self.raw_buffer[2]
-                frame_size = 3 + num_channel * 4
+
+            if header == 0xA5A5:
+                # Need header + length
+                if len(self.raw_buffer) < 3:
+                    break
+
+                payload_length = self.raw_buffer[2]
+
+                # Total frame size:
+                # header (2) + length (1) + payload
+                frame_size = 3 + payload_length
+
                 if len(self.raw_buffer) < frame_size:
                     break
-                values = []
-                offset = 3
-                for _ in range(num_channel):
-                    value = struct.unpack(
-                        "<f",
-                        self.raw_buffer[offset:offset+4]
-                    )[0]
-                    values.append(value)
-                    offset += 4
-                self.data_received.emit(values)
+
+                payload = bytes(self.raw_buffer[3:frame_size])
+
+                # Payload must contain:
+                # COM_TYPE + ADDRESS
+                if payload_length < 2:
+                    self.raw_buffer = self.raw_buffer[frame_size:]
+                    continue
+
+                com_type = payload[0]
+                address = payload[1]
+                data = payload[2:]
+
+                # print(
+                #     f"RX frame: "
+                #     f"type=0x{com_type:02X}, "
+                #     f"addr=0x{address:02X}, "
+                #     f"data={data.hex(' ')}"
+                # )
+
+                if com_type == 0x00: # RESPONSE
+                    self.response_queue.put(
+                        (address, data)
+                    )
+
+                elif com_type == 0x05: # STREAMING
+                    if len(data) != 4:
+                        print(f"Invalid streaming data length: {len(data)}")
+                        continue
+                    value = struct.unpack("<f", data)[0]
+                    self.data_received.emit(address, value)
+                    # print(f'addr:{address} | data:{value}')
+
+                elif com_type == 0x06: # EVENT
+                    self.handle_event(
+                        address,
+                        data
+                    )
+
+                else:
+                    print(
+                        f"Unknown COM_TYPE: 0x{com_type:02X}"
+                    )
+
                 self.raw_buffer = self.raw_buffer[frame_size:]
 
-            # COMMAND RESPONSE
-            elif header == 0xA55A:
-                if self.expected_response_size is None:
-                    break
-                frame_size = 2 + self.expected_response_size
-                if len(self.raw_buffer) < frame_size:
-                    break
-                payload = bytes(self.raw_buffer[2:frame_size])
-                self.response_queue.put(payload)
-                self.raw_buffer = self.raw_buffer[frame_size:]
-                self.expected_response_size = None
-
+            # UNKNOWN HEADER
             else:
                 self.raw_buffer.pop(0)
-    
+
     def stop(self):
         self.running = False
         if self.serial_conn and self.serial_conn.is_open:
@@ -261,6 +294,7 @@ class LivePlotter(QtWidgets.QMainWindow):
         }
         self.setup_console_completion()
 
+        self.disabled_addresses = set()
         self.channels = {}
         self.used_colors = set()
         self.available_colors = [
@@ -325,7 +359,9 @@ class LivePlotter(QtWidgets.QMainWindow):
         self.plot_widget.setLabel('left', 'Value')
         self.plot_widget.setLabel('bottom', 'Sample')
         self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
-        self.plot_widget.addLegend()
+        self.legend = self.plot_widget.addLegend()
+        # self.legend.setParentItem(self.plot_widget.plotItem)
+        # self.legend.setVisible(True)
         
         layout.addWidget(self.plot_widget)
         
@@ -435,7 +471,8 @@ class LivePlotter(QtWidgets.QMainWindow):
             self.acq_thread.start()
             
             # Initialize motor protocol
-            self.motor = MotorProtocol(self.serial_conn, self.acq_thread)
+            # self.motor = MotorProtocol(self.serial_conn, self.acq_thread)
+            self.motor = SFMotion(self.serial_conn, self.acq_thread)
             
             # Update console namespace
             self.console_namespace["thread"] = self.acq_thread
@@ -451,24 +488,23 @@ class LivePlotter(QtWidgets.QMainWindow):
             print("Serial connection established successfully")
 
             # setup plotter
-            motor_mode = self.motor.get_foc_motor_mode()['mode']
+            motor_mode = self.motor.get_motor_mode()
             print(f'motor mode: {motor_mode}')
             if motor_mode == 0:
-                self.motor.plotter_add_line('Is_ref')
-                self.motor.plotter_add_line('id')
-                self.motor.plotter_add_line('iq')
-                self.motor.plotter_add_line('e_rad')
-                # self.motor.plotter_add_line('v_bus')
+                self.enable_streaming(self.motor.channel.current_set_point)
+                self.enable_streaming(self.motor.channel.id)
+                self.enable_streaming(self.motor.channel.iq)
+                self.enable_streaming(self.motor.channel.e_rad)
+                self.enable_streaming(self.motor.channel.v_bus)
             elif motor_mode == 1:
-                self.motor.plotter_add_line('rpm_ref')
-                self.motor.plotter_add_line('actual_rpm')
+                self.enable_streaming(self.motor.channel.speed_set_point)
+                self.enable_streaming(self.motor.channel.actual_rpm)
             elif motor_mode == 2:
-                self.motor.plotter_add_line('pos_ref')
-                self.motor.plotter_add_line('actual_angle')
+                self.enable_streaming(self.motor.channel.position_set_point)
+                self.enable_streaming(self.motor.channel.actual_angle)
             else:
-                self.motor.plotter_add_line('m_angle_rad')
-                self.motor.plotter_add_line('m_angle_rad_comp')
-
+                self.enable_streaming(self.motor.channel.m_angle_rad)
+                self.enable_streaming(self.motor.channel.m_angle_rad_comp)
 
             
         except serial.SerialException as e:
@@ -523,89 +559,97 @@ class LivePlotter(QtWidgets.QMainWindow):
         if color in self.used_colors:
             self.used_colors.remove(color)
 
-    def on_data_received(self, values):
+    def remove_channel(self, address):
+        if address not in self.channels:
+            return
+
+        ch = self.channels.pop(address)
+        line = ch["line"]
+
+        self.legend.removeItem(line)
+        self.plot_widget.removeItem(line)
+        self.release_color(ch["color"])
+
+        self.disabled_addresses.add(address)
+
+        if not self.channels:
+            self.legend.setVisible(False)
+
+
+    def on_data_received(self, address, value):
         if self.paused or not self.is_connected:
             return
 
+        if address in self.disabled_addresses:
+            return
+
+        if address not in self.channels:
+            register = self.motor.registers.get(address)
+            name = register["name"] if register is not None else f"Address {address}"
+
+            buffer = deque(maxlen=self.max_points)
+            time_buffer = deque(maxlen=self.max_points)
+
+            color = self.get_next_color()
+            pen = pg.mkPen(color=color, width=1.5)
+
+            line = self.plot_widget.plot([], [], pen=pen)
+            self.legend.addItem(line, name)
+
+            if not self.legend.isVisible():
+                self.legend.setVisible(True)
+
+            self.channels[address] = {
+                "line": line,
+                "buffer": buffer,
+                "time": time_buffer,
+                "color": color,
+                "name": name
+            }
+
+        ch = self.channels[address]
+        ch["buffer"].append(value)
+        ch["time"].append(self.counter)
         self.counter += 1
-        self.time_buffer.append(self.counter)
-
-        # remove channel
-        for name in list(self.channels.keys()):
-            if name not in self.motor.plotter_channels:
-                ch = self.channels.pop(name)
-                ch["line"].clear()
-                self.plot_widget.removeItem(ch["line"])
-                if "color" in ch:
-                    self.release_color(ch["color"])
-                if name in self.data_buffers:
-                    self.data_buffers.remove(name)
-
-        # add channel
-        for idx, name in enumerate(self.motor.plotter_channels):
-            if name not in self.channels:
-                buffer = deque(
-                    [np.nan] * (len(self.time_buffer)-1),
-                    maxlen=self.max_points
-                )
-                self.data_buffers.append(buffer)
-                
-                color = self.get_next_color()
-                
-                pen = pg.mkPen(
-                    color=color,
-                    width=1.5
-                )
-                line = self.plot_widget.plot(
-                    [],
-                    [],
-                    pen=pen,
-                    name=name
-                )
-                self.channels[name] = {
-                    "line": line,
-                    "buffer": buffer,
-                    "color": color
-                }
-
-        for idx, name in enumerate(self.motor.plotter_channels):
-            if idx < len(values):
-                self.channels[name]["buffer"].append(values[idx])
-            else:
-                self.channels[name]["buffer"].append(np.nan)
-
-        self.status_label.setText(
-            f"Received {len(values)} values"
-        )
+        self.status_label.setText(f"{ch['name']}: {value:.3f}")
     
     def update_plot(self):
         if self.paused or not self.is_connected:
             return
-        
-        # Update setiap line
-        x = np.asarray(self.time_buffer)
-        for name in self.motor.plotter_channels:
-            if name not in self.channels:
-                continue
-            ch = self.channels[name]
+
+        for address, ch in self.channels.items():
+            x = np.asarray(ch["time"])
             y = np.asarray(ch["buffer"])
-            n = min(len(x), len(y))
-            if n == 0:
+
+            if len(x) == 0:
                 continue
-            ch["line"].setData(x[-n:], y[-n:])
-        
+
+            ch["line"].setData(x, y)
+
         # Set X range
-        if len(self.time_buffer) > 0:
+        if self.counter > 0:
             x_min = max(0, self.counter - self.max_points)
             x_max = self.counter
-            self.plot_widget.setXRange(x_min, x_max, padding=0.05)
 
-        # Auto-range jika diperlukan
+            self.plot_widget.setXRange(
+                x_min,
+                x_max,
+                padding=0.05
+            )
+
+        # Auto range
         if self.auto_range_check.isChecked():
             self.auto_range()
-        
-        # Update info
-        self.info_label.setText(f'Samples: {len(self.time_buffer)} | FPS: {self.fps_result}')
+
+        total_samples = sum(
+            len(ch["buffer"])
+            for ch in self.channels.values()
+        )
+
+        self.info_label.setText(
+            f"Samples: {total_samples} | FPS: {self.fps_result}"
+        )
+
         self.fps_counter += 1
     
     def auto_range(self):
@@ -640,14 +684,13 @@ class LivePlotter(QtWidgets.QMainWindow):
         self.fps_counter = 0
     
     def clear_data(self):
-        for name in self.channels:
-            self.channels[name]["buffer"].clear()
-        self.time_buffer.clear()
+        for address, ch in self.channels.items():
+            ch["buffer"].clear()
+            ch["time"].clear()
+            ch["line"].setData([], [])
+
         self.counter = 0
-        
-        for name in self.channels:
-            self.channels[name]["line"].setData([], [])
-        
+
         print("Data cleared")
     
     def toggle_pause(self):
@@ -665,6 +708,21 @@ class LivePlotter(QtWidgets.QMainWindow):
             self.fps_timer.stop()
             
         event.accept()
+
+    def disable_streaming(self, address):
+        self.motor.disable_streaming(address)
+        self.remove_channel(address)
+
+    def enable_streaming(self, address):
+        self.motor.enable_streaming(address)
+        self.disabled_addresses.discard(address)
+
+
+
+
+
+
+
 
     def run_motor_sequence(self, mode, sequence):
         if (

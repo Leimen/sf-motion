@@ -29,7 +29,8 @@
 #include "FOC_utils.h"
 #include "self_commissioning.h"
 #include "storage.h"
-#include "com.h"
+#include "sf_motion_usb_com.h"
+#include "sf_motion_com.h"
 #include "string.h"
 /* USER CODE END Includes */
 
@@ -72,8 +73,10 @@ uint32_t adc_buff[4];
 foc_t hfoc1;
 self_commissioning_t hsc1;
 storage_t hstorage1;
-com_t husb_com;
-com_t hcan_com;
+
+sfm_usb_com_t hsfm_usb_com;
+sfm_com_t husb_com;
+sfm_com_t hcan_com;
 can_protocol_t can_motor;
 
 char usb_send_buff[64];
@@ -139,14 +142,19 @@ int read_flash(void *data, uint32_t len) {
   return 0;
 }
 
-int usb_recv_data(uint8_t *data, uint16_t len) {
-  (void)data;
-  (void)len;
+int usb_send_data(uint8_t *data, uint16_t len) {
+  if (CDC_Transmit_FS(data, len) != USBD_OK) return -1;
   return 0;
 }
 
-int usb_send_data(uint8_t *data, uint16_t len) {
-  if (CDC_Transmit_FS(data, len) != USBD_OK) return -1;
+int sfm_com_usb_send_data(uint8_t *data, uint16_t len) {
+  if (sfm_usb_com_start_send_data(&hsfm_usb_com, data, len) == 0) return 0;
+  return -1;
+}
+
+int sfm_com_usb_recv_data(uint8_t *data, uint16_t len) {
+  (void)data;
+  (void)len;
   return 0;
 }
 
@@ -193,8 +201,9 @@ static void init_foc(void) {
   };
   can_motor_init(&can_motor, can_config, can_send_buff, can_recv_buff);
 #if USB_TO_CAN
-  com_init(&husb_com, usb_recv_data, usb_send_data, HAL_GetTick, &hfoc1, &hstorage1, &hsc1);
-  com_init(&hcan_com, can_recv_data, can_send_data, HAL_GetTick, &hfoc1, &hstorage1, &hsc1);
+  sfm_usb_com_init(&hsfm_usb_com, usb_send_data);
+  sfm_com_init(&husb_com, sfm_com_usb_recv_data, sfm_com_usb_send_data, HAL_GetTick, &hfoc1, &hstorage1, &hsc1);
+  sfm_com_init(&hcan_com, can_recv_data, can_send_data, HAL_GetTick, &hfoc1, &hstorage1, &hsc1);
 #else
   init_trig_lut();
   link_set_pwm_freq(&htim1, BLDC_PWM_FREQ);
@@ -206,8 +215,10 @@ static void init_foc(void) {
   foc_inverter_init(&hfoc1, motor1_inverter_enable, motor1_inverter_disable, motor1_get_pwm_res);
   foc_feedback_sensor_init(&hfoc1, motor1_as5047p_get_mech_deg, hstorage1.memory.encoder_config.error_comp_deg, NORMAL_DIR);
   foc_speed_feedback_sensor_init(&hfoc1, 600.0f, 1.0f/SPEED_TS);
-  com_init(&husb_com, usb_recv_data, usb_send_data, HAL_GetTick, &hfoc1, &hstorage1, &hsc1);
-  com_init(&hcan_com, can_recv_data, can_send_data, HAL_GetTick, &hfoc1, &hstorage1, &hsc1);
+
+  sfm_usb_com_init(&hsfm_usb_com, usb_send_data);
+  sfm_com_init(&husb_com, sfm_com_usb_recv_data, sfm_com_usb_send_data, HAL_GetTick, &hfoc1, &hstorage1, &hsc1);
+  sfm_com_init(&hcan_com, can_recv_data, can_send_data, HAL_GetTick, &hfoc1, &hstorage1, &hsc1);
 
   storage_read_config(&hstorage1);
   storage_copy_to_local(&hstorage1, &hfoc1);
@@ -372,16 +383,16 @@ int main(void)
     indicator_update();
     can_motor_send_frame_update(&can_motor);
     if (can_motor_recv_frame_update(&can_motor) == 0) {
-      hcan_com.data_rx = can_motor.rx_frame.data;
-      hcan_com.data_rx_len = can_motor.rx_frame.total_data_length;
+      // hcan_com.data_rx = can_motor.rx_frame.data;
+      // hcan_com.data_rx_len = can_motor.rx_frame.total_data_length;
       hcan_com.incomming_data_flag = 1;
     }
 #if USB_TO_CAN
     usb_to_can_update();
 #else
     AS5047P_update(&hencd1);
-    com_update(&husb_com);
-    com_update(&hcan_com);
+    sfm_com_update(&husb_com);
+    sfm_com_update(&hcan_com);
     self_commissioning_update();
 #endif
     /* USER CODE END WHILE */

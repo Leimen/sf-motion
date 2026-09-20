@@ -21,3 +21,5 @@ communication/__pycache__/
 # KiCad generated files
 *.kicad_prl
 *.kicad_wks-bak
+
+_old_ver/

@@ -22,7 +22,8 @@
 #include "usbd_cdc_if.h"
 
 /* USER CODE BEGIN INCLUDE */
-#include "com.h"
+#include "sf_motion_usb_com.h"
+#include "sf_motion_com.h"
 /* USER CODE END INCLUDE */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -109,9 +110,8 @@ uint8_t UserTxBufferFS[APP_TX_DATA_SIZE];
 extern USBD_HandleTypeDef hUsbDeviceFS;
 
 /* USER CODE BEGIN EXPORTED_VARIABLES */
-extern uint8_t *p_usb_data_rx;
-extern com_t husb_com;
-extern com_t hcan_com;
+extern sfm_usb_com_t hsfm_usb_com;
+extern sfm_com_t husb_com;
 /* USER CODE END EXPORTED_VARIABLES */
 
 /**
@@ -265,9 +265,11 @@ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
   /* USER CODE BEGIN 6 */
   USBD_CDC_SetRxBuffer(&hUsbDeviceFS, &Buf[0]);
   USBD_CDC_ReceivePacket(&hUsbDeviceFS);
-  husb_com.data_rx = Buf;
-  husb_com.data_rx_len = *Len;
-  husb_com.incomming_data_flag = 1;
+  hsfm_usb_com.data_rx = Buf;
+  hsfm_usb_com.data_rx_len = *Len;
+  if (sfm_usb_com_receive_data(&hsfm_usb_com, husb_com.data_rx, (uint16_t*)&husb_com.data_rx_len) == 0) {
+    husb_com.incomming_data_flag = 1;
+  }
   return (USBD_OK);
   /* USER CODE END 6 */
 }
