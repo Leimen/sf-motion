@@ -23,7 +23,6 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "stm32f405_link.h"
-#include "CAN.h"
 #include "motor.h"
 #include "AS5047P.h"
 #include "FOC_utils.h"
@@ -77,7 +76,6 @@ storage_t hstorage1;
 sfm_usb_com_t hsfm_usb_com;
 sfm_com_t husb_com;
 sfm_com_t hcan_com;
-can_protocol_t can_motor;
 
 char usb_send_buff[64];
 uint8_t can_send_buff[64];
@@ -166,9 +164,9 @@ int can_recv_data(uint8_t *data, uint16_t len) {
 
 int can_send_data(uint8_t *data, uint16_t len) {
 #if USB_TO_CAN
-  return can_motor_start_send_data(&can_motor, 0x02, data, len);
+  return link_can_send_data(0x02, data, len);
 #else
-  return can_motor_start_send_data(&can_motor, 0x01, data, len);
+  return link_can_send_data(0x01, data, len);
 #endif
 }
 
@@ -192,14 +190,7 @@ static void init_encoder(void) {
 }
 
 static void init_foc(void) {
-  can_config_t can_config = {
-    .init = link_can_init,
-    .send_data = link_can_send_data,
-    .recv_data = link_can_recv_data,
-    .is_mailboxes_free = link_can_is_mailboxes_free,
-    .get_tick_ms = HAL_GetTick
-  };
-  can_motor_init(&can_motor, can_config, can_send_buff, can_recv_buff);
+  link_can_init();
 #if USB_TO_CAN
   sfm_usb_com_init(&hsfm_usb_com, usb_send_data);
   sfm_com_init(&husb_com, sfm_com_usb_recv_data, sfm_com_usb_send_data, HAL_GetTick, &hfoc1, &hstorage1, &hsc1);
@@ -321,7 +312,10 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef* hadc) {
 
 // CAN RX FIFO 0 Callback
 void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan){
-  can_motor_recv_chunked_frame(&can_motor);
+  uint32_t id;
+  if (link_can_recv_data(&id, hcan_com.data_rx, &hcan_com.data_rx_len) == 0) {
+    hcan_com.incomming_data_flag = 1;
+  }
 }
 
 /**************************************************************************** */
@@ -381,12 +375,6 @@ int main(void)
   while (1)
   {
     indicator_update();
-    can_motor_send_frame_update(&can_motor);
-    if (can_motor_recv_frame_update(&can_motor) == 0) {
-      // hcan_com.data_rx = can_motor.rx_frame.data;
-      // hcan_com.data_rx_len = can_motor.rx_frame.total_data_length;
-      hcan_com.incomming_data_flag = 1;
-    }
 #if USB_TO_CAN
     usb_to_can_update();
 #else
